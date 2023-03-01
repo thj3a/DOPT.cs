@@ -5,6 +5,12 @@ using System.Drawing;
 using System.Text.Json;
 using TorchSharp;
 using static TorchSharp.torch;
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+
 
 var rng = new Random();
 var path = $"./../../../experiment.json";
@@ -24,51 +30,244 @@ var device = torch.device("cpu");
 var instance = matFile.Variables.ToDictionary(x => x.Name);
 int[] d = matFile["A"].Value.Dimensions;
 
+double[] rawA = matFile["A"].Value.ConvertToDoubleArray();
+double[,] A = new double[d[0], d[1]];
 
-Tensor A = torch.tensor(matFile["A"].Value.ConvertToDoubleArray(), device: device, dtype: ScalarType.Float64).reshape(new long[] { d[1], d[0] }).T;
-Tensor R = tensor(matFile["R"].Value.ConvertToDoubleArray(), dtype: torch.int64).flatten();
+for (int i = 0; i < d[0]; i++)
+{
+  for (int j = 0; j < d[1]; j++)
+  {
+    A[i, j] = rawA[(i + j * d[0])];
+  }
+}
+double[] x = new double[d[0]];
+for (int i = 0; i < x.Length; i++)
+{
+  if (i < d[0] / 2)
+    x[i] = 1;
+}
 
-int maxGenerations = 10_001;
+// Tensor tensorA = tensor(matFile["A"].Value.ConvertToDoubleArray(), device: device, dtype: ScalarType.Float64).reshape(new long[] { d[1], d[0] }).T;
+Tensor tensorA = tensor(A);
+Tensor tensorR = tensor(matFile["R"].Value.ConvertToDoubleArray(), dtype: torch.int64).flatten();
+Tensor tensorX = tensor(x);
+
+var times = new List<long>();
+var runs = 1_000;
+var stopwatch = new Stopwatch();
+
+// var results = torch.linalg.slogdet(mm(mm(tensorA.T, torch.diag(x)), tensorA));
+var AT = Transpose(A);
+var diagX = Diagonal(x);
+
+
+static double[,] Transpose(double[,] Mat)
+{
+  int dim1 = Mat.GetLength(0);
+  int dim2 = Mat.GetLength(1);
+  double[,] RMat = new double[dim2, dim1];
+  for (int i = 0; i < dim2; i++)
+  {
+    for (int j =0; j < dim1; j++)
+    {
+      RMat[i, j] = Mat[j, i];
+    }
+  }
+  return RMat;
+}
+static double[,] Diagonal(double[] x)
+{
+  int dim = x.Length;
+  double[,] RMat = new double[dim, dim];
+  for (int i = 0; i < dim; i++)
+  {
+    for (int j = 0; j < dim; j++)
+    {
+      if (i == j)
+        RMat[i, j] = x[i];
+      else
+        RMat[i, j] = 0;
+    }
+  }
+  return RMat;
+}
+static double DET(double[,] Mat)
+{
+  int n = Mat.GetLength(0);
+  if (n != Mat.GetLength(1))
+    throw new Exception("Dimensions of matrix must be equal");
+  
+  double d = 0;
+  int k, i, j, subi, subj;
+  double[,] SUBMat = new double[n, n];
+
+  if (n == 2)
+  {
+    return ((Mat[0, 0] * Mat[1, 1]) - (Mat[1, 0] * Mat[0, 1]));
+  }
+
+  else
+  {
+    for (k = 0; k < n; k++)
+    {
+      subi = 0;
+      for (i = 1; i < n; i++)
+      {
+        subj = 0;
+        for (j = 0; j < n; j++)
+        {
+          if (j == k)
+          {
+            continue;
+          }
+          SUBMat[subi, subj] = Mat[i, j];
+          subj++;
+        }
+        subi++;
+      }
+      d = d + (Math.Pow(-1, k) * Mat[0, k] * DET(SUBMat));
+    }
+  }
+  return d;
+}
+static double determinant(double[,] array)
+{
+  double det = 0;
+  double total = 0;
+  double[,] tempArr = new double[array.GetLength(0) - 1, array.GetLength(1) - 1];
+
+  if (array.GetLength(0) == 2)
+  {
+    det = array[0, 0] * array[1, 1] - array[0, 1] * array[1, 0];
+  }
+
+  else
+  {
+
+    for (int i = 0; i < 1; i++)
+    {
+      for (int j = 0; j < array.GetLength(1); j++)
+      {
+        tempArr = fillNewArr(array, 0, j);
+        det = determinant(tempArr) * (Math.Pow(-1, j) * array[0, j]);
+        total += det; ;
+      }
+    }
+  }
+  return det;
+}
+static double[,] fillNewArr(double[,] originalArr, int row, int col)
+{
+  double[,] tempArray = new double[originalArr.GetLength(0) - 1, originalArr.GetLength(1) - 1];
+
+  for (int i = 0, newRow = 0; i < originalArr.GetLength(0); i++)
+  {
+    if (i == row)
+      continue;
+    for (int j = 0, newCol = 0; j < originalArr.GetLength(1); j++)
+    {
+      if (j == col) continue;
+      tempArray[newRow, newCol] = originalArr[i, j];
+
+      newCol++;
+    }
+    newRow++;
+  }
+  return tempArray;
+
+}
+static double[,] MultiplyMatrix(double[,] A, double[,] B)
+{
+  int rA = A.GetLength(0);
+  int cA = A.GetLength(1);
+  int rB = B.GetLength(0);
+  int cB = B.GetLength(1);
+
+  if (cA != rB)
+    throw new Exception("Number of columns of matrix A must equal number of rows of matrix B");
+  
+  double temp = 0;
+  double[,] kHasil = new double[rA, cB];
+
+  for (int i = 0; i < rA; i++)
+  {
+    for (int k = 0; k < cA; k++)
+    {
+      for (int j = 0; j < cB; j++)
+      {
+        kHasil[i, j] += A[i, k] * B[k, j];
+      }
+    }
+  }
+  //Parallel.For(0, rA, i =>
+  //{
+  //  Parallel.For(0, cA, k =>
+  //  {
+  //    Parallel.For(0, cB, j =>
+  //    {
+  //      kHasil[i, j] += A[i, k] * B[k, j];
+  //    });
+  //  });
+  // });
+
+  return kHasil;
+}
+
+int maxGenerations = 10_000;
 int maxTime = 1800 * 1000;
-int populationSize = 30;
-double offspringProportion = 1;
-double eliteProportion = .01;
+int populationSize = 100;
+double offspringProportion = .5;
+double eliteProportion = .3;
 double mutationRate = .1;
 double crossoverRate = .9;
 double best_objval = double.NegativeInfinity;
-Chromosome best_chromosome;
-
-List<Chromosome> population = InitializePopulation(populationSize, d[0], A, R);
-best_chromosome = population[0];
 
 int offspringSize = (int)Math.Ceiling(offspringProportion * populationSize);
-int eliteSizeInt = (int)Math.Ceiling(eliteProportion * populationSize);
+int eliteSize = (int)Math.Ceiling(eliteProportion * populationSize);
 
-List<Chromosome> offspring = new(offspringSize+eliteSizeInt);
-List<Chromosome> elite = new(eliteSizeInt);
-List<Chromosome> common = new(populationSize-eliteSizeInt);
+List<Chromosome> offspring = new(offspringSize+eliteSize);
+List<Chromosome> elite = new(eliteSize);
+List<Chromosome> common = new(populationSize-eliteSize);
 
 var sw = new Stopwatch();
+var sw_crossover = new Stopwatch();
+var sw_selection = new Stopwatch();
+var sw_mutation = new Stopwatch();
+var sw_evaluation = new Stopwatch();
+
+List<Chromosome> population = InitializePopulation(populationSize, tensorA, tensorR);
+
+
+sw_evaluation.Start();
+Parallel.ForEach(population, x => x.CalculateFitness());
+sw_evaluation.Stop();
+Chromosome best_chromosome = population.OrderByDescending(x => x.Fitness).First();
+LocalSearch(population.OrderByDescending(x => x.Fitness).Take(1).ToList());
+
 sw.Start();
 
 for (int generation = 0; generation < maxGenerations; generation++)
 {
-  if (generation % 5000 == 0)
-  {
-    var result = LocalSearch(population);
-    population.AddRange(result);
-    //population.Add(new Chromosome(population[0].Length, A));
-  }
+  //if (generation % 5000 == 0)
+  //{
+  //  var result = LocalSearch(population);
+  //  population.AddRange(result);
+  //  //population.Add(new Chromosome(population[0].Length, A));
+  //}
 
-  while (offspring.Count <= offspringProportion)
+  while (offspring.Count <= offspringSize)
   {
     if (rng.NextDouble() < crossoverRate)
     {
-      List<Chromosome> selected = Selection(population, 2, rng);
+      sw_selection.Start();
+      List<Chromosome> selected = Selection(population, 2, rng, Chromosome.SelectionType.random);
+      sw_selection.Stop();
       Chromosome parent1 = selected[0];
       Chromosome parent2 = selected[1];
 
-      List<Chromosome> offsprings = Crossover(parent1, parent2, A);
+      sw_crossover.Start();
+      List<Chromosome> offsprings = Crossover(parent1, parent2, tensorA);
+      sw_crossover.Stop();
       offspring.AddRange(offsprings);
     }
 
@@ -76,14 +275,17 @@ for (int generation = 0; generation < maxGenerations; generation++)
     {
       if (offspring.Count > 0)
       {
-        Chromosome mutant = Mutate(Selection(offspring, 1, rng)[0], A, rng);
+        sw_mutation.Start();
+        Chromosome mutant = Mutate(Selection(offspring, 1, rng, Chromosome.SelectionType.random)[0], tensorA, rng);
+        sw_mutation.Stop();
         offspring.Add(mutant);
       }
     }
   }
-
-
-
+  
+  sw_evaluation.Start();
+  Parallel.ForEach(offspring, chromosome => chromosome.CalculateFitness());
+  sw_evaluation.Stop();
   population.AddRange(offspring);
   Chromosome best_c = population.OrderByDescending(x => x.Fitness).First();
 
@@ -95,14 +297,16 @@ for (int generation = 0; generation < maxGenerations; generation++)
 
   var avg = population.Select(x => x.Fitness).Average();
   var var = population.Select(x => Math.Pow(x.Fitness - avg, 2)).Sum()/population.Count;
-  Console.WriteLine($"Best value at iteration {generation}: value: {best_c.Fitness}, best ever: {best_objval}, max genes: {population.Max(x=> x.Genes.sum().item<double>())} avg: {avg} var: {var}");
-
+  //Console.WriteLine($"Best value at iteration {generation}: value: {best_c.Fitness}, best ever: {best_objval}, max genes: {population.Max(x=> x.Genes.sum().item<double>())} avg: {avg} var: {var}");
 
   elite.Clear();
   common.Clear();
-  elite = PickElite(population, eliteSizeInt);
-  common = Selection(population, populationSize-eliteSizeInt, rng);
-
+  
+  sw_selection.Start();
+  elite = population.OrderByDescending(x => x.Fitness).Take(eliteSize).ToList();
+  common = Selection(population, populationSize-eliteSize, rng, Chromosome.SelectionType.roulette);
+  sw_selection.Stop();
+  
   population.Clear();
   population.AddRange(elite);
   population.AddRange(common);
@@ -111,9 +315,26 @@ for (int generation = 0; generation < maxGenerations; generation++)
 }
 sw.Stop();
 
-Console.WriteLine($"Best chromosome sum: {best_chromosome.Genes.sum().item<double>()} value: {best_chromosome.CalculateFitness()}, total time: {sw.Elapsed}");
-best_chromosome.Genes.print();
+Console.WriteLine($"Best chromosome sum: {best_chromosome.Genes.sum().item<double>()} value: {best_chromosome.Fitness}, total time (ms): {sw.ElapsedMilliseconds}");
+Console.WriteLine($"Crossover time: {sw_crossover.ElapsedMilliseconds}");
+Console.WriteLine($"Selection time: {sw_selection.ElapsedMilliseconds}");
+Console.WriteLine($"Mutation time: {sw_mutation.ElapsedMilliseconds}");
+Console.WriteLine($"Evaluation time: {sw_evaluation.ElapsedMilliseconds}");
 
+static double CalculateFitnessTensor(Tensor A, Tensor x)
+{
+  var (sign, result) = torch.linalg.slogdet(mm(mm(A.T, torch.diag(x)), A));
+  double r;
+  if (sign.item<double>() < 0)
+  {
+    r = double.NegativeInfinity;
+  }
+  else
+  {
+    r = result.item<double>();
+  }
+  return r;
+}
 static List<Chromosome> LocalSearch(List<Chromosome> population)
 {
   List<Chromosome> new_population = new(); 
@@ -157,8 +378,7 @@ static List<Chromosome> LocalSearch(List<Chromosome> population)
   }
   return new_population;
 }
-
-static List<Chromosome> InitializePopulation(int size, int length, Tensor A, Tensor R)
+static List<Chromosome> InitializePopulation(int size, Tensor A, Tensor R)
 {
   List<Chromosome> population = new List<Chromosome>();
 
@@ -169,33 +389,37 @@ static List<Chromosome> InitializePopulation(int size, int length, Tensor A, Ten
     // random 
     population.Add(new Chromosome(A));
   }
+  Parallel.ForEach(population, chromosome => chromosome.CalculateFitness());
   return population;
 }
-static List<Chromosome> Selection(List<Chromosome> population, int size, Random rng)
+static List<Chromosome> Selection(List<Chromosome> population, int size, Random rng, Chromosome.SelectionType sel_type)
 {
   List<Chromosome> selected = new(size);
   while (selected.Count < size)
   {
-    // weighted
-    //var p = population.OrderBy(_ => rng.NextDouble()).RandomElementByWeight(x => Math.Abs(1 / x.Fitness));
-    //if (p != null)
-    //{
-    //  selected.Add(p);
-    //}
+    switch (sel_type)
+    {
+      case Chromosome.SelectionType.roulette: 
+        var p_roulette = population.OrderBy(_ => rng.NextDouble()).RandomElementByWeight(x => Math.Abs(1 / x.Fitness));
+        if (p_roulette != null)
+        {
+          selected.Add(p_roulette);
+        }
+        break;
+      case Chromosome.SelectionType.random:
+        var p_random = population.OrderBy(x => rng.NextDouble()).Take(size);
+        selected.AddRange(p_random);
+        break;
+      case Chromosome.SelectionType.n_best:
+        var p_nbest = population.OrderBy(x => x.Fitness).Take(size);
+        selected.AddRange(p_nbest);
+        break;
+      default:
+        break;
+    }
 
-    //// n best
-    //var p = population.OrderBy(x => x.Fitness).Take(size);
-    //selected.AddRange(p);
-
-    // random
-    var p = population.OrderBy(x => rng.NextDouble()).Take(size);
-    selected.AddRange(p);
   }
   return selected;
-}
-static List<Chromosome> PickElite(List<Chromosome> population, int size)
-{
-  return population.OrderByDescending(x => x.Fitness).Take(size).ToList();
 }
 static List<Chromosome> Crossover(Chromosome parent1, Chromosome parent2, Tensor A)
 {
@@ -289,6 +513,13 @@ class Chromosome
   public Tensor A { get; private set; }
   public double Fitness { get; private set; }
 
+  public enum SelectionType
+  {
+    random = 1,
+    roulette = 2,
+    n_best = 3
+  }
+
   public Chromosome(Tensor matrix_a)
   {
     this.A = matrix_a;
@@ -297,8 +528,7 @@ class Chromosome
     Tensor X = x[torch.randperm(length)].clone();
     Genes = X;
     Length = (int)Genes.shape[0];
-    var f = CalculateFitness();
-    Fitness = f;
+    //CalculateFitness();
   }
   public Chromosome(Tensor R, Tensor matrix_A, Func<Tensor, bool, (Tensor U, Tensor S, Tensor Vh)> svd)
   {
@@ -317,27 +547,29 @@ class Chromosome
 
     this.Genes = x;
     this.Length = (int)x.shape[0];
-    this.Fitness = CalculateFitness();
+    //CalculateFitness();
   }
   public Chromosome(Tensor genes, Tensor matrix_a)
   {
     A = matrix_a;
     Genes = genes;
     Length = (int)Genes.shape[0];
-    Fitness = CalculateFitness();
+    //CalculateFitness();
   }
 
-  public double CalculateFitness()
+  public void CalculateFitness()
   {
     var (sign, result) = torch.linalg.slogdet(mm(mm(this.A.T, torch.diag(this.Genes)), A));
+    double r;
     if (sign.item<double>() < 0)
     {
-      return double.NegativeInfinity;
+      r =  double.NegativeInfinity;
     }
     else
     {
-      return result.item<double>();
+      r = result.item<double>();
     }
+    Fitness = r;
   }
 
   public double CalculateFitness(Tensor A, Tensor x)
@@ -352,6 +584,7 @@ class Chromosome
       return result.item<double>();
     }
   }
+
 
   public override string ToString()
   {
